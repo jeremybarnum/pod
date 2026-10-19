@@ -28,6 +28,18 @@ type PODState struct {
 	PodProgress    response.PodProgress
 	ActivationTime time.Time `toml:"activation_time"`
 
+	// Delivery over time, as a pod meters it: the basal schedule (pulses per
+	// half hour, from ScheduleOrigin), a temp basal's pulses per half hour
+	// from TempBasalStart, the fraction of a pulse not yet given, and when
+	// delivery was last counted.
+	BasalSchedule   []uint16  `toml:"basal_schedule"`
+	ScheduleOrigin  time.Time `toml:"schedule_origin"`
+	TempBasalPulses float64   `toml:"temp_basal_pulses"`
+	TempBasalStart  time.Time `toml:"temp_basal_start"`
+	PulseFraction   float64   `toml:"pulse_fraction"`
+	CountedAt       time.Time `toml:"counted_at"`
+	BolusNotGiven   uint16    `toml:"bolus_not_given"` // a cancelled bolus's pulses
+
 	Reservoir        uint16 `toml:"reservoir"`
 	ActiveAlertSlots uint8  `toml:"alerts"`
 	FaultEvent       uint8  `toml:"fault"`
@@ -86,6 +98,60 @@ func (p *PODState) MinutesActive() uint16 {
 	return uint16(time.Now().Sub(p.ActivationTime).Round(time.Minute).Minutes())
 }
 
+// Count adds the basal and temp basal pulses given since the last count, as
+// the pod's pump does: by the half hour's rate, a temp basal over the schedule,
+// nothing while delivery is stopped or before the cannula is in.
+func (p *PODState) Count(now time.Time) {
+	if p.CountedAt.IsZero() || p.PodProgress < response.PodProgressRunningAbove50U || p.PodProgress > response.PodProgressRunningBelow50U {
+		p.CountedAt = now
+		return
+	}
+	t := p.CountedAt
+	for t.Before(now) {
+		next := now
+		var perSecond float64
+		switch {
+		case p.TempBasalEnd.After(t):
+			if p.TempBasalEnd.Before(next) {
+				next = p.TempBasalEnd
+			}
+			perSecond = p.TempBasalPulses / 1800
+		case p.BasalActive && len(p.BasalSchedule) > 0:
+			into := t.Sub(p.ScheduleOrigin)
+			half := int(into/(30*time.Minute)) % len(p.BasalSchedule)
+			if half < 0 {
+				half += len(p.BasalSchedule)
+			}
+			boundary := p.ScheduleOrigin.Add((into/(30*time.Minute) + 1) * 30 * time.Minute)
+			if into < 0 {
+				boundary = t.Add(30 * time.Minute)
+			}
+			if boundary.Before(next) {
+				next = boundary
+			}
+			perSecond = float64(p.BasalSchedule[half]) / 1800
+		}
+		p.PulseFraction += perSecond * next.Sub(t).Seconds()
+		t = next
+	}
+	whole := uint16(p.PulseFraction)
+	p.PulseFraction -= float64(whole)
+	p.Delivered += whole
+	if p.Reservoir >= whole {
+		p.Reservoir -= whole
+	}
+	p.CountedAt = now
+}
+
+// DeliveredNow is the pulses given so far: what the pump has counted, less a
+// bolus's pulses still to come.
+func (p *PODState) DeliveredNow() uint16 {
+	if p.BolusEnd.After(time.Now()) {
+		return p.Delivered - p.BolusRemaining()
+	}
+	return p.Delivered
+}
+
 // NOTE: only handles immediate boluses; any extended bolus is not accounted for
 func (p *PODState) BolusRemaining() uint16 {
 	now := time.Now()
@@ -100,6 +166,6 @@ func (p *PODState) BolusRemaining() uint16 {
 		}
 		return bolusSecondsRemaining / secondsPerPulse
 	} else {
-		return 0
+		return p.BolusNotGiven
 	}
 }

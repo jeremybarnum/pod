@@ -428,7 +428,7 @@ func (p *Pod) makeGeneralStatusResponse() response.Response {
 		BasalActive:         p.state.BasalActive,
 		ExtendedBolusActive: p.state.ExtendedBolusActive,
 		PodProgress:         p.state.PodProgress,
-		Delivered:           p.state.Delivered,
+		Delivered:           p.state.DeliveredNow(),
 		BolusRemaining:      p.state.BolusRemaining(),
 		MinutesActive:       p.state.MinutesActive(),
 	}
@@ -447,7 +447,7 @@ func (p *Pod) makeDetailedStatusResponse() response.Response {
 		BasalActive:         p.state.BasalActive,
 		ExtendedBolusActive: p.state.ExtendedBolusActive,
 		PodProgress:         p.state.PodProgress,
-		Delivered:           p.state.Delivered,
+		Delivered:           p.state.DeliveredNow(),
 		BolusRemaining:      p.state.BolusRemaining(),
 		MinutesActive:       p.state.MinutesActive(),
 		FaultEvent:          p.state.FaultEvent,
@@ -534,6 +534,8 @@ func (p *Pod) clearAlerts(alertMask uint8) {
 }
 
 func (p *Pod) handleCommand(cmd command.Command) {
+	// What the pump gave since the last command, under the delivery then running.
+	p.state.Count(time.Now())
 
 	// this progress advancement happens in the pump control logic in a real pod
 	if p.state.PodProgress == response.PodProgressPriming {
@@ -599,16 +601,36 @@ func (p *Pod) handleCommand(cmd command.Command) {
 		// Programming basal schedule
 		if c.TableNum == 0 {
 			p.state.BasalActive = true
+			if len(c.Schedule) == 48 {
+				// The pod is in half hour c.Duration with c.Pulses still to give in it;
+				// the schedule's origin is that half hour's start.
+				p.state.BasalSchedule = c.Schedule
+				half := int(c.Duration)
+				left := time.Duration(0)
+				if pp := c.Schedule[half%48]; pp > 0 {
+					left = time.Duration(float64(c.Pulses) / float64(pp) * float64(30*time.Minute))
+				}
+				p.state.ScheduleOrigin = time.Now().Add(left - 30*time.Minute - time.Duration(half)*30*time.Minute)
+			}
 		}
 
 		// Programming temp basal
 		if c.TableNum == 1 {
+			p.state.TempBasalStart = time.Now()
 			p.state.TempBasalEnd = time.Now().Add(time.Duration(c.Duration) * time.Hour / 2)
+			p.state.TempBasalPulses = 0
+			for _, pp := range c.Schedule {
+				p.state.TempBasalPulses += float64(pp)
+			}
+			if len(c.Schedule) > 0 {
+				p.state.TempBasalPulses /= float64(len(c.Schedule))
+			}
 		}
 
 		// Programming bolus; just immediately decrement reservoir
 		// Would be nice to eventually simulate actual pulses over time.
 		if c.TableNum == 2 {
+			p.state.BolusNotGiven = 0
 			p.state.Delivered += c.Pulses
 			p.state.Reservoir -= c.Pulses
 			if p.state.PodProgress >= response.PodProgressRunningAbove50U {
@@ -621,6 +643,14 @@ func (p *Pod) handleCommand(cmd command.Command) {
 	case *command.StopDelivery: // 0x1F
 		if c.StopBolus {
 			p.state.ExtendedBolusActive = false
+			// The pulses not yet given are not given.
+			if p.state.BolusEnd.After(time.Now()) {
+				left := p.state.BolusRemaining()
+				p.state.Delivered -= left
+				p.state.Reservoir += left
+				p.state.BolusEnd = time.Now()
+				p.state.BolusNotGiven = left
+			}
 		}
 		if c.StopTempBasal {
 			p.state.TempBasalEnd = time.Time{}

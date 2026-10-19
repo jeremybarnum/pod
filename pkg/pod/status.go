@@ -72,6 +72,7 @@ func (p *Pod) Status() Status {
 	p.snapMtx.Unlock()
 
 	now := time.Now()
+	s.Count(now)
 	name := progressNames[s.PodProgress]
 	if name == "" {
 		name = fmt.Sprintf("%d", s.PodProgress)
@@ -87,7 +88,7 @@ func (p *Pod) Status() Status {
 		Progress:            int(s.PodProgress),
 		ProgressName:        name,
 		Reservoir:           float64(s.Reservoir) * 0.05,
-		Delivered:           float64(s.Delivered) * 0.05,
+		Delivered:           float64(s.DeliveredNow()) * 0.05,
 		ActivationTime:      s.ActivationTime,
 		MinutesActive:       int(s.MinutesActive()),
 		Alerts:              s.ActiveAlertSlots,
