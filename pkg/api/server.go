@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/avereha/pod/pkg/pod"
 	"github.com/gorilla/websocket"
@@ -173,6 +174,11 @@ func (s *Server) handleCommand(bytes []byte) error {
 			return err
 		}
 		s.pod.SetActiveTime(int(value))
+	case "slowNextCommand":
+		if err := needValue("seconds", 0, 30); err != nil {
+			return err
+		}
+		s.pod.SlowNextCommand(time.Duration(value * float64(time.Second)))
 	case "crashNextCommand":
 		beforeProcessing, ok := msg["beforeProcessing"].(bool)
 		if !ok {

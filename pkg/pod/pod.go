@@ -46,6 +46,10 @@ type Pod struct {
 var crashBeforeProcessingCommand bool
 var crashAfterProcessingCommand bool
 
+// Once set, the next command that changes the pod's state waits this long before the pod acts on
+// it and answers, as a pod slow to accept a command: the app sees the command sent, not accepted.
+var slowNextCommand time.Duration
+
 func New(ble *bluetooth.Ble, state *PODState) *Pod {
 	ret := &Pod{
 		ble:   ble,
@@ -564,6 +568,13 @@ func (p *Pod) handleCommand(cmd command.Command) {
 	if crashBeforeProcessingCommand && cmd.DoesMutatePodState() {
 		log.Fatalf("pkg pod; Crashing before processing command with sequence %d", cmd.GetSeq())
 	}
+	if slowNextCommand > 0 && cmd.DoesMutatePodState() {
+		hold := slowNextCommand
+		slowNextCommand = 0
+		log.Infof("pkg pod; holding command with sequence %d for %v before acting on it", cmd.GetSeq(), hold)
+		time.Sleep(hold)
+		p.state.Count(time.Now())
+	}
 
 	switch c := cmd.(type) {
 	case *command.GetVersion: // 0x03
@@ -713,6 +724,13 @@ func (p *Pod) SetActiveTime(newVal int) {
 	p.state.ActivationTime = time.Now().Add(-time.Duration(newVal) * time.Minute)
 	p.state.Save()
 	p.takeSnapshot()
+	p.mtx.Unlock()
+}
+
+// SlowNextCommand holds the next state-changing command for d before the pod acts on it.
+func (p *Pod) SlowNextCommand(d time.Duration) {
+	p.mtx.Lock()
+	slowNextCommand = d
 	p.mtx.Unlock()
 }
 
