@@ -116,7 +116,7 @@ type Ble struct {
 	messageInput  chan *message.Message
 	messageOutput chan *message.Message
 
-	stopLoop    chan bool
+	stopLoop    chan bool // guarded by genMtx
 	reconnected chan bool
 	radio       Radio
 
@@ -305,7 +305,18 @@ func (b *Ble) servingCurrentConnection() bool {
 	return b.connGen == b.servingGen
 }
 
+// ShutdownConnection is the pod hanging up. Its message loop ends with the
+// connection, and what the phone wrote on it is no longer read: the pod reads
+// the next connection afresh, as after the phone's own reconnect.
 func (b *Ble) ShutdownConnection() {
+	b.StopMessageLoop()
+	for len(b.messageInput) > 0 {
+		<-b.messageInput
+	}
+	b.genMtx.Lock()
+	close(b.in.closed)
+	b.in = newInput()
+	b.genMtx.Unlock()
 	b.radio.Disconnect()
 }
 
@@ -350,22 +361,30 @@ func (b *Ble) loop(stop chan bool, in *input) {
 }
 
 func (b *Ble) StartMessageLoop() {
-	if b.stopLoop != nil {
-		log.Fatalf("pkg bluetooth; Messaging loop is already running")
-	}
 	b.genMtx.Lock()
+	if b.stopLoop != nil {
+		// Not reached since the pod's own hang-ups stop it; once, it exited
+		// the simulator ("Messaging loop is already running"). Two loops would
+		// split the connection's packets: the old one ends here.
+		log.Warnf("pkg bluetooth; a message loop was still running: stopping it first")
+		close(b.stopLoop)
+	}
 	b.servingGen = b.connGen
+	b.stopLoop = make(chan bool)
+	stop, in := b.stopLoop, b.in
 	b.genMtx.Unlock()
 	select {
 	case <-b.reconnected:
 	default:
 	}
-	b.stopLoop = make(chan bool)
-	go b.loop(b.stopLoop, b.input())
+	go b.loop(stop, in)
 }
 
+// StopMessageLoop ends the message loop, if one runs: on a new connection
+// from the phone, or the pod hanging up.
 func (b *Ble) StopMessageLoop() {
-	// race condition, but this is called only on device disconnect
+	b.genMtx.Lock()
+	defer b.genMtx.Unlock()
 	if b.stopLoop != nil {
 		close(b.stopLoop)
 		b.stopLoop = nil
@@ -399,7 +418,7 @@ func (b *Ble) writeMessage(msg *message.Message, in *input, stop chan bool) erro
 	sum := crc32.ChecksumIEEE(bytes)
 	if len(bytes) <= 18 {
 		buf.WriteByte(byte(index))
-		buf.WriteByte(0)     // fragments
+		buf.WriteByte(0) // fragments
 
 		buf.WriteByte(byte(sum >> 24))
 		buf.WriteByte(byte(sum >> 16))

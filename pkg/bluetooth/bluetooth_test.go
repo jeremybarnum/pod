@@ -104,3 +104,32 @@ func TestANewConnectionReadsOnlyItsOwnPackets(t *testing.T) {
 		t.Fatalf("read payload % x, want % x", got.Payload, sent.Payload)
 	}
 }
+
+// The pod hanging up on an idle phone (after three minutes) and hearing a
+// command before the phone's reconnect reads that command and starts its
+// message loop again, where it used to exit: "Messaging loop is already
+// running" (the cloud bench's run 25, 2026-10-22).
+func TestAHangUpEndsTheMessageLoop(t *testing.T) {
+	pod := newEnd(t, &wire{})
+	pod.Connected()
+	pod.StartMessageLoop()
+
+	pod.ShutdownConnection()
+	got := make(chan Packet, 1)
+	go func() {
+		p, _ := pod.ReadCmd()
+		got <- p
+	}()
+	time.Sleep(50 * time.Millisecond)
+	pod.CmdWritten(CmdRTS)
+	select {
+	case p := <-got:
+		if !bytes.Equal(p, CmdRTS) {
+			t.Fatalf("read %x", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the hung-up connection's message loop took the next command")
+	}
+	pod.StartMessageLoop()
+	pod.StopMessageLoop()
+}
