@@ -7,6 +7,7 @@ import (
 	toml "github.com/pelletier/go-toml"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/response"
 )
 
@@ -46,7 +47,11 @@ type PODState struct {
 	FaultTime        uint16 `toml:"fault_time"`
 	Delivered        uint16 `toml:"delivered"`
 
-	TriggerTimes     [8]uint16 `toml:"trigger_times"`
+	// FaultBolusRemaining is the bolus a fault left undelivered. A faulted
+	// pod keeps reporting it, however late it is read.
+	FaultBolusRemaining uint16 `toml:"fault_bolus_remaining"`
+
+	TriggerTimes [8]uint16 `toml:"trigger_times"`
 
 	// At some point these could be replaced with details
 	// of each kind of delivery (volume, start time, schedule, etc)
@@ -59,16 +64,45 @@ type PODState struct {
 	// PeripheralID is the identifier the iOS Simulator transport gives the pod.
 	PeripheralID string `toml:"peripheral_id"`
 
+	// Mode is the kind of pod being simulated, "dash" or "o5". It is kept
+	// with the state so that restarting the simulator does not change the
+	// pod the phone paired with.
+	Mode string `toml:"mode"`
+
+	// PdmId is the controller that paired the pod. An Omnipod 5
+	// advertises it, and the control panel shows it.
+	PdmId uint32 `toml:"pdm_id"`
+
+	// ControllerPublic is the phone's signing key, taken from the
+	// certificate it showed while pairing. An Omnipod 5 checks the
+	// signature on every insulin, cancel and deactivate command against it.
+	ControllerPublic []byte `toml:"controller_public"`
+
+	// SignedRejected counts the commands refused for want of a good
+	// signature. A real pod answers those with error 0x2A, and anything
+	// above zero here means the phone sent one the pod would not take.
+	SignedRejected uint32 `toml:"signed_rejected"`
+
 	Filename string
 }
 
 // NewFreshState is a new pod, not yet paired.
-func NewFreshState(filename string) *PODState {
+func NewFreshState(filename string, mode bluetooth.Mode) *PODState {
 	return &PODState{
 		Reservoir:      150 / 0.05,
 		ActivationTime: time.Now(),
 		Filename:       filename,
+		Mode:           string(mode),
 	}
+}
+
+// PodMode is the kind of pod this state belongs to. A state file written
+// before the simulator could be anything else holds no mode and is a DASH.
+func (p *PODState) PodMode() bluetooth.Mode {
+	if p.Mode == string(bluetooth.ModeO5) {
+		return bluetooth.ModeO5
+	}
+	return bluetooth.ModeDash
 }
 
 func NewState(filename string) (*PODState, error) {
@@ -152,8 +186,27 @@ func (p *PODState) DeliveredNow() uint16 {
 	return p.Delivered
 }
 
+// SetFault stops the bolus where it is, so what it left undelivered is not
+// counted as delivered. Clearing the fault (0) forgets it.
+func (p *PODState) SetFault(code uint8) {
+	if code == 0 {
+		p.FaultBolusRemaining = 0
+	} else if p.FaultEvent == 0 {
+		remaining := p.BolusRemaining()
+		p.FaultBolusRemaining = remaining
+		p.Delivered -= remaining
+		p.Reservoir += remaining
+		p.BolusEnd = time.Time{}
+	}
+	p.FaultEvent = code
+	p.FaultTime = p.MinutesActive()
+}
+
 // NOTE: only handles immediate boluses; any extended bolus is not accounted for
 func (p *PODState) BolusRemaining() uint16 {
+	if p.FaultEvent != 0 {
+		return p.FaultBolusRemaining
+	}
 	now := time.Now()
 	var secondsPerPulse uint16
 	if p.BolusEnd.After(now) {

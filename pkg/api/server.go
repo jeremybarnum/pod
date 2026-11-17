@@ -179,6 +179,22 @@ func (s *Server) handleCommand(bytes []byte) error {
 			return err
 		}
 		s.pod.SlowNextCommand(time.Duration(value * float64(time.Second)))
+	case "failNextConnects":
+		if err := needValue("connect count", 0, 100); err != nil {
+			return err
+		}
+		hangUpAfter := 7.0
+		if v, ok := msg["hangUpAfter"].(float64); ok {
+			hangUpAfter = v
+		}
+		if err := s.pod.FailNextConnects(int(value), time.Duration(hangUpAfter*float64(time.Second))); err != nil {
+			return err
+		}
+	case "ignoreNextMessages":
+		if err := needValue("message count", 0, 100); err != nil {
+			return err
+		}
+		s.pod.IgnoreNextMessages(int(value))
 	case "crashNextCommand":
 		beforeProcessing, ok := msg["beforeProcessing"].(bool)
 		if !ok {
